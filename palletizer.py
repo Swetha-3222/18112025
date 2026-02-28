@@ -14,7 +14,7 @@ from openpyxl.utils import get_column_letter
 
 # -------------------- Page --------------------
 st.set_page_config(page_title="Palletizer", layout="wide")
-st.markdown("<h2 style='text-align:center; color:#008080;'>JK Fenner Palletizer Dashboard>", unsafe_allow_html=True)
+st.markdown("<h2 style='text-align:center; color:#008080;'>JK Fenner Palletizer Dashboard — MaxRects Edition</h2>", unsafe_allow_html=True)
 
 # -------------------- Defaults --------------------
 DEFAULT_PALLET = {'L': 48.0, 'W': 40.0, 'H': 36.0}
@@ -38,6 +38,43 @@ DEFAULT_BOXES = {
 }
 MOQ = 10  # units per box
 
+# ---------------------------------------------------
+# RULE CONFIGURATION
+# ---------------------------------------------------
+
+BOX_GROUP_RULES = {
+    "AZ3":  ["AZ4"],
+    "AZ4":  ["AZ3"],
+    "AZ5":  ["AZ2", "AZ6"],
+    "AZ10": ["AZ7", "AZ2"],
+    "AZ14": ["AZ5", "AZ16"],
+}
+
+FILLER_BOX = "AZ2"
+STRICT_SINGLE_PALLET = ["AZ18"]
+CONDITIONAL_SEPARATE = ["AZ13", "AZ17"]
+
+def conflicts(box_a, box_b):
+    """Return True if box_a and box_b are not allowed together"""
+    if box_a in BOX_GROUP_RULES:
+        if box_b in BOX_GROUP_RULES[box_a]:
+            return True
+    if box_b in BOX_GROUP_RULES:
+        if box_a in BOX_GROUP_RULES[box_b]:
+            return True
+    return False
+
+
+def pallet_has_conflict(pallet_obj, new_box, strict=True):
+    if not strict:
+        return False
+
+    for layer in pallet_obj['layers']:
+        for placed in layer['boxes']:
+            if conflicts(placed['name'], new_box):
+                return True
+    return False
+
 def normalize_box_name(name: str) -> str:
     return ''.join(ch for ch in str(name).upper().strip() if ch.isalnum())
 
@@ -58,6 +95,7 @@ with st.sidebar:
     customer_name = st.text_input("Customer Name (alphabets only)")
     invoice_no = st.text_input("Invoice Number (whole numbers)")
     po_ref_no = st.text_input("PO Reference Number (whole numbers)")
+    dc = st.text_input("Direct Customer (alphabets only)")
 
     scale = st.number_input("Scale factor (visual)", value=8, min_value=1)
     st.markdown("---")
@@ -237,40 +275,43 @@ class MaxRectsBin:
         return {'name': name, 'x': used.x, 'y': used.y, 'L': used.w, 'W': used.h, 'rotated': rotated}
 
 # -------------------- Packer: pack one layer using MaxRects --------------------
-def pack_one_layer_maxrects(pallet_L, pallet_W, boxes_info, order_left):
-    """
-    boxes_info: dict of code -> {'L','W','H','Area'}
-    order_left: dict code -> count (mutated)
-    returns placed_list (list of placements) and updated order_left
-    """
-    # build list of items to try to place sorted by area desc
-    items = []
-    for code, cnt in order_left.items():
-        for i in range(cnt):
-            items.append((code, boxes_info[code]['L'], boxes_info[code]['W'], boxes_info[code]['H']))
-    if not items:
-        return [], order_left
+def pack_one_layer_maxrects(pallet_L, pallet_W, boxes_info, order_left, current_layer_index, ignore_group_rules=False ):
 
-    # sort largest area first improves packing
-    items.sort(key=lambda t: t[1]*t[2], reverse=True)
-
-    bin = MaxRectsBin(pallet_L, pallet_W, allow_rotate=True)
+    bin_pack = MaxRectsBin(pallet_L, pallet_W, allow_rotate=True)
     placed = []
-    used_count = {}
-    for code, Lb, Wb, Hb in items:
-        res = bin.insert(code, Lb, Wb)
-        if res is None:
-            # try rotated (MaxRects already considers rotation in insert), so skip
-            continue
-        # placed successfully
-        placed.append({'name': code, 'x': res['x'], 'y': res['y'], 'L': res['L'], 'W': res['W'], 'H': boxes_info[code]['H'], 'rotated': res['rotated']})
-        used_count[code] = used_count.get(code, 0) + 1
 
-    # subtract used_count from order_left
-    for k, v in used_count.items():
-        order_left[k] -= v
-        if order_left[k] < 0:
-            order_left[k] = 0
+    sequence = build_rule_sequence(order_left)
+
+    for code in sequence:
+
+        while order_left.get(code, 0) > 0:
+
+            # AZ13 & AZ17 not allowed in bottom 2 layers
+            if code in CONDITIONAL_SEPARATE and current_layer_index < 2:
+                break
+
+            if not ignore_group_rules:
+                if not is_group_valid(code, order_left):
+                    break
+
+
+            dims = boxes_info[code]
+            result = bin_pack.insert(code, dims['L'], dims['W'])
+
+            if not result:
+                break
+
+            placed.append({
+                "name": code,
+                "x": result['x'],
+                "y": result['y'],
+                "L": result['L'],
+                "W": result['W'],
+                "H": dims['H'],
+                "rotated": result['rotated']
+            })
+
+            order_left[code] -= 1
 
     return placed, order_left
 
@@ -282,73 +323,181 @@ def build_info(boxes):
         info[nm] = {'L': float(L), 'W': float(W), 'H': float(H), 'Area': float(L)*float(W)}
     return info
 
-def pack_all_pallets_maxrects(pallet, boxes, order_counts, reserve_small=False):
-    """
-    pallet: dict L,W,H
-    boxes: dict code -> [L,W,H]
-    order_counts: dict code->count
-    reserve_small: if True, reserve small remainders (legacy)
-    Returns: list of pallets where each pallet is list of layers, each layer is list of placed boxes
-    """
-    order_left = copy.deepcopy(order_counts)
+
+# ===============================
+# MAIN PACKING FUNCTION
+# ===============================
+
+def pack_all_pallets_maxrects(pallet, boxes, order_counts):
+
     info = build_info(boxes)
-    pallets_layers = []
 
-    # Optionally compute and reserve remainders (legacy). Default false for better packing.
-    forced_remainders = {}
-    if reserve_small:
-        for code, tot in list(order_left.items()):
-            if tot <= 0:
+    # Expand boxes
+    all_boxes = []
+    for code, qty in order_counts.items():
+        for _ in range(qty):
+            all_boxes.append(code)
+
+    # Global First-Fit Decreasing
+    all_boxes.sort(key=lambda x: info[x]['Area'], reverse=True)
+
+    pallets = []
+    unplaced_phase1 = []
+
+    def try_place(box_code, strict=True):
+
+        box_height = info[box_code]['H']
+
+        for pallet_obj in pallets:
+
+            # Conflict check
+            if pallet_has_conflict(pallet_obj, box_code, strict):
                 continue
-            # estimate per-layer count by fitting box on pallet once
-            per_layer_est = max(1, int((pallet['L'] // info[code]['L']) * (pallet['W'] // info[code]['W'])))
-            if per_layer_est == 0:
-                per_layer_est = 1
-            rem = tot % per_layer_est
-            if rem and (rem <= 5 or rem <= math.ceil(0.10 * tot)):
-                forced_remainders[code] = rem
-                order_left[code] -= rem
 
-    # Now pack until nothing left
-    while sum(order_left.values()) > 0:
-        layers_for_this_pallet = []
-        current_stack_height = 0.0
-        while current_stack_height < pallet['H'] and sum(order_left.values()) > 0:
-            # attempt to pack a layer
-            placed, order_left = pack_one_layer_maxrects(pallet['L'], pallet['W'], info, order_left)
-            if not placed:
-                # cannot place any more boxes in this pallet layer stack (maybe some tall box etc.)
-                break
-            tallest = max([b['H'] for b in placed]) if placed else 0
-            # if adding this layer exceeds height, revert the placements (put back to order_left) and break
-            if current_stack_height + tallest > pallet['H'] + 1e-9:
-                # return those placed to order_left
-                for b in placed:
-                    order_left[b['name']] = order_left.get(b['name'], 0) + 1
-                break
-            layers_for_this_pallet.append(placed)
-            current_stack_height += tallest
-        if not layers_for_this_pallet:
-            # can't put any layer -> break to avoid infinite loop
-            break
-        pallets_layers.append(layers_for_this_pallet)
+            # Try existing layers
+            for layer_index, layer_obj in enumerate(pallet_obj['layers']):
 
-    # After main packing, add dedicated pallets for forced remainders
-    for code, rem in forced_remainders.items():
-        dims = boxes[code]
-        per_layer = max(1, int((pallet['L'] // dims[0]) * (pallet['W'] // dims[1])))
-        if per_layer == 0:
-            per_layer = 1
-        while rem > 0:
-            take = min(per_layer, rem)
-            layer = []
-            # naive stacked placement with x/y zeros (visualization will scale)
-            for _ in range(take):
-                layer.append({'name': code, 'x': 0.0, 'y': 0.0, 'L': dims[0], 'W': dims[1], 'H': dims[2], 'rotated': False})
-            pallets_layers.append([layer])
-            rem -= take
+                # Stability rule
+                if box_code in CONDITIONAL_SEPARATE and layer_index > 1:
+                    continue
 
-    return pallets_layers
+                result = layer_obj['bin'].insert(
+                    box_code,
+                    info[box_code]['L'],
+                    info[box_code]['W']
+                )
+
+                if result:
+                    layer_obj['boxes'].append({
+                        "name": box_code,
+                        "x": result['x'],
+                        "y": result['y'],
+                        "L": result['L'],
+                        "W": result['W'],
+                        "H": box_height,
+                        "rotated": result['rotated']
+                    })
+                    return True
+
+            # Try new layer
+            current_height = sum(l['height'] for l in pallet_obj['layers'])
+
+            if current_height + box_height <= pallet['H']:
+
+                new_layer_index = len(pallet_obj['layers'])
+
+                if box_code in CONDITIONAL_SEPARATE and new_layer_index > 1:
+                    continue
+
+                new_bin = MaxRectsBin(pallet['L'], pallet['W'], allow_rotate=True)
+
+                result = new_bin.insert(
+                    box_code,
+                    info[box_code]['L'],
+                    info[box_code]['W']
+                )
+
+                if result:
+                    pallet_obj['layers'].append({
+                        'bin': new_bin,
+                        'boxes': [{
+                            "name": box_code,
+                            "x": result['x'],
+                            "y": result['y'],
+                            "L": result['L'],
+                            "W": result['W'],
+                            "H": box_height,
+                            "rotated": result['rotated']
+                        }],
+                        'height': box_height
+                    })
+                    return True
+
+        return False
+
+    # -------------------------
+    # PHASE 1 — STRICT
+    # -------------------------
+    for box_code in all_boxes:
+
+        placed = try_place(box_code, strict=True)
+
+        if not placed:
+            unplaced_phase1.append(box_code)
+
+    # -------------------------
+    # PHASE 2 — RELAX RULES
+    # -------------------------
+    for box_code in unplaced_phase1:
+
+        placed = try_place(box_code, strict=False)
+
+        if not placed:
+            # Create new pallet only if absolutely necessary
+            new_bin = MaxRectsBin(pallet['L'], pallet['W'], allow_rotate=True)
+
+            result = new_bin.insert(
+                box_code,
+                info[box_code]['L'],
+                info[box_code]['W']
+            )
+
+            pallets.append({
+                'layers': [{
+                    'bin': new_bin,
+                    'boxes': [{
+                        "name": box_code,
+                        "x": result['x'],
+                        "y": result['y'],
+                        "L": result['L'],
+                        "W": result['W'],
+                        "H": info[box_code]['H'],
+                        "rotated": result['rotated']
+                    }],
+                    'height': info[box_code]['H']
+                }]
+            })
+
+    pallet_layers = []
+    for p in pallets:
+        pallet_layers.append([layer['boxes'] for layer in p['layers']])
+
+    print(f"\n✅ Total pallets used: {len(pallet_layers)}")
+
+    return pallet_layers
+
+def is_group_valid(code, order_left):
+    if code in BOX_GROUP_RULES:
+        for partner in BOX_GROUP_RULES[code]:
+            if order_left.get(partner, 0) <= 0:
+                return False
+    return True
+
+def build_rule_sequence(order_left):
+    sequence = []
+    visited = set()
+
+    for code in order_left:
+        if order_left[code] <= 0 or code in visited:
+            continue
+
+        if code in BOX_GROUP_RULES:
+            group = [code] + BOX_GROUP_RULES[code]
+            for g in group:
+                if order_left.get(g, 0) > 0:
+                    sequence.append(g)
+                    visited.add(g)
+        else:
+            sequence.append(code)
+            visited.add(code)
+
+    # AZ2 as filler → always last
+    if FILLER_BOX in sequence:
+        sequence.remove(FILLER_BOX)
+        sequence.append(FILLER_BOX)
+
+    return sequence
+
 
 # -------------------- Parse pasted orders --------------------
 order_counts = {}
@@ -426,8 +575,25 @@ boxes_for_packing = copy.deepcopy(DEFAULT_BOXES)
 # -------------------- Run packer --------------------
 pallet = {'L': float(pallet_L), 'W': float(pallet_W), 'H': float(pallet_H)}
 reserve_flag = enable_reserve
-pallet_layers = pack_all_pallets_maxrects(pallet, boxes_for_packing, order_counts, reserve_small=reserve_flag)
+pallet_layers = pack_all_pallets_maxrects(pallet, boxes_for_packing, order_counts)
+st.success(f"Total pallets used: {len(pallet_layers)}")
 total_pallets = len(pallet_layers)
+
+parts = set()
+
+for pal in pallet_layers:
+    for layer in pal:
+        for box in layer:
+            part = box.get("part")
+            if part:
+                parts.add(part)
+
+if len(parts) == 1:
+    pass
+
+    # do not finalize pallet
+    # push back boxes to order_left
+
 
 # -------------------- Assign parts to placed boxes for summary & visuals --------------------
 local_queues_for_summary = {k: v.copy() for k, v in order_part_queue.items()}
@@ -621,23 +787,11 @@ def create_layout_pdf_visuals(assigned_layer_details, pallet):
     c.save()
     return path
 
-def clear_values_after_row(ws, start_row=7, row_height=40):
+def clear_values_after_row(ws, start_row=7):
     max_row = ws.max_row
     max_col = ws.max_column
 
-    # 1️⃣ Collect merged ranges to unmerge (only those touching rows >= start_row)
-    merged_ranges = list(ws.merged_cells.ranges)
-
-    for merged_range in merged_ranges:
-        min_row = merged_range.min_row
-        max_r = merged_range.max_row
-
-        if max_r >= start_row:
-            ws.unmerge_cells(str(merged_range))
-
-    # 2️⃣ Clear values + set row height
     for r in range(start_row, max_row + 1):
-        ws.row_dimensions[r].height = row_height
         for c in range(1, max_col + 1):
             ws.cell(row=r, column=c).value = None
 
@@ -645,7 +799,8 @@ def create_excel_report(
     assigned_layers_per_pallet,
     customer_name,
     invoice_no,
-    po_ref_no
+    po_ref_no,
+    dc
 ):
     template_path = os.path.join(os.path.dirname(__file__), "Report format.xlsx")
     wb = load_workbook(template_path)
@@ -686,7 +841,8 @@ def create_excel_report(
                 ws.cell(row=current_row, column=9, value=MOQ)            # QTY
                 ws.cell(row=current_row, column=10, value=gr)            # GR WT
                 ws.cell(row=current_row, column=11, value=nt)            # NT WT
-                ws.cell(row=current_row, column=12, value=po_ref_no)     # PO REF
+                ws.cell(row=current_row, column=12, value=po_ref_no)    
+                ws.cell(row=current_row, column=13, value=dc)            # Direct Customer
 
                 global_box_no += 1
                 current_row += 1
@@ -712,7 +868,7 @@ def create_excel_report(
     for p_idx in range(2, len(assigned_layers_per_pallet) + 1):
         ws_new = wb.copy_worksheet(template_ws)
         ws_new.title = f"Pallet {p_idx}"
-        clear_values_after_row(ws_new, start_row=7, row_height=40)
+        clear_values_after_row(ws_new, start_row=7)
         write_pallet(ws_new, p_idx, assigned_layers_per_pallet[p_idx - 1])
 
     # ---------------- Save output ----------------
@@ -754,7 +910,8 @@ with top_cols[4]:
             assigned_layers_per_pallet,
             customer_name,
             invoice_no,
-            po_ref_no
+            po_ref_no,
+            dc
         )
         with open(report_path, "rb") as f:
             st.download_button(
